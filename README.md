@@ -9,9 +9,14 @@ A personal code snippets manager enhanced with AI capabilities.
 - Tailwind CSS
 - Node.js
 - Express.js
-- MySQL
+- Supabase
 - Google Gemini API
 - Google OAuth 2.0
+```markdown
+- Framer Motion
+- Lucide React
+- React Hot Toast
+
 
 ## AI Features & Uniqueness
 
