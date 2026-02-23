@@ -1,323 +1,918 @@
-require('dotenv').config();
-const express = require('express');
-const mysql = require('mysql2/promise'); // Use mysql2/promise for async/await
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const { OAuth2Client } = require('google-auth-library');
-const rateLimit = require('express-rate-limit');
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const { createClient } = require("@supabase/supabase-js");
+const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
+const compression = require("compression");
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
-// --- Database Connection Pool ---
-const dbPool = mysql.createPool({
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'code_snippets_manager_db',
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+// --- Security Headers ---
+app.use(
+  helmet({
+    contentSecurityPolicy: false, // Let frontend handle CSP
+    crossOriginEmbedderPolicy: false,
+  }),
+);
+
+// --- Compression for all responses ---
+app.use(compression());
+
+// --- CORS (whitelist origins) ---
+const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
+  .split(",")
+  .map((s) => s.trim());
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Not allowed by CORS"));
+      }
+    },
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  }),
+);
+
+// --- Body parsing with size limits ---
+app.use(express.json({ limit: "5mb" })); // Allow large code snippets up to 5MB
+app.use(express.urlencoded({ extended: false, limit: "1mb" }));
+
+// --- Request timeout middleware ---
+app.use((req, res, next) => {
+  req.setTimeout(30000); // 30 second timeout
+  res.setTimeout(30000);
+  next();
 });
 
-// --- Helper to ensure is_starred column exists ---
-const ensureStarredColumns = async () => {
-    try {
-        const checkColumn = async (table) => {
-            const [columns] = await dbPool.query(`SHOW COLUMNS FROM ${table} LIKE 'is_starred'`);
-            if (columns.length === 0) {
-                console.log(`Adding is_starred column to ${table}...`);
-                await dbPool.query(`ALTER TABLE ${table} ADD COLUMN is_starred BOOLEAN DEFAULT FALSE`);
-            }
-        };
-        await checkColumn('folders');
-        await checkColumn('snippets');
-    } catch (error) {
-        console.error('Error checking/updating schema:', error);
-    }
+// --- Supabase Admin Client (singleton, connection pooled) ---
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  {
+    auth: { autoRefreshToken: false, persistSession: false },
+    db: { schema: "public" },
+  },
+);
+
+// --- Helper: Create Supabase client with user's JWT ---
+const createUserClient = (token) => {
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
+    global: { headers: { Authorization: `Bearer ${token}` } },
+    auth: { autoRefreshToken: false, persistSession: false },
+    db: { schema: "public" },
+  });
 };
 
-const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+// --- Rate Limiting ---
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 300, // Increased for heavy use: 300 requests per 15 min
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many requests, please try again later." },
+});
 
 const authLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 10, // Limit each IP to 10 login/signup requests per windowMs
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: 'Too many requests from this IP, please try again after 15 minutes',
+  windowMs: 15 * 60 * 1000,
+  max: 20, // Strict: 20 auth attempts per 15 min
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many login attempts. Please try again later." },
 });
 
-// --- JWT Middleware ---
-const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (token == null) return res.status(401).json({ message: 'Unauthorized' });
+const aiLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 30, // 30 AI requests per minute
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "AI rate limit exceeded. Please wait a moment." },
+});
 
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ message: 'Forbidden' });
-        req.user = user;
-        next();
-    });
+app.use("/api", apiLimiter);
+
+// --- Input Sanitization Helper ---
+const sanitizeString = (str, maxLen = 500) => {
+  if (typeof str !== "string") return "";
+  return str.trim().slice(0, maxLen);
 };
 
-// --- Auth Routes ---
-app.post('/api/auth/signup', authLimiter, async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        // Basic validation
-        if (!email || !password || password.length < 6) {
-            return res.status(400).json({ message: 'Invalid input. Password must be at least 6 characters.' });
-        }
-        const [rows] = await dbPool.query('SELECT email FROM users WHERE email = ?', [email]);
-        if (rows.length > 0) {
-            return res.status(409).json({ message: 'User with this email already exists.' });
-        }
-        const hashedPassword = await bcrypt.hash(password, 10);
-        await dbPool.query('INSERT INTO users (email, password) VALUES (?, ?)', [email, hashedPassword]);
-        res.status(201).json({ message: 'User created successfully.' });
-    } catch (error) {
-        res.status(500).json({ message: 'Internal server error.' });
+const validateUUID = (id) => {
+  if (typeof id !== "string") return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    id,
+  );
+};
+
+// --- Auth Middleware (with token caching for performance) ---
+const tokenCache = new Map(); // Simple in-memory cache
+const TOKEN_CACHE_TTL = 60 * 1000; // 1 minute
+
+const authenticateToken = async (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token)
+    return res
+      .status(401)
+      .json({ message: "Unauthorized: No token provided." });
+
+  // Check cache first for performance
+  const cached = tokenCache.get(token);
+  if (cached && Date.now() - cached.timestamp < TOKEN_CACHE_TTL) {
+    req.user = cached.user;
+    req.token = token;
+    return next();
+  }
+
+  try {
+    const {
+      data: { user },
+      error,
+    } = await supabaseAdmin.auth.getUser(token);
+    if (error || !user) {
+      tokenCache.delete(token);
+      return res.status(403).json({ message: "Invalid or expired token." });
     }
+
+    // Cache user for 1 minute
+    tokenCache.set(token, { user, timestamp: Date.now() });
+
+    // Cleanup old cache entries periodically (prevent memory leak)
+    if (tokenCache.size > 1000) {
+      const now = Date.now();
+      for (const [key, val] of tokenCache) {
+        if (now - val.timestamp > TOKEN_CACHE_TTL) tokenCache.delete(key);
+      }
+    }
+
+    req.user = user;
+    req.token = token;
+    next();
+  } catch (err) {
+    return res.status(403).json({ message: "Token verification failed." });
+  }
+};
+
+// =============================================================
+// AUTH ROUTES (proxied to Supabase Auth)
+// =============================================================
+
+app.post("/api/auth/signup", authLimiter, async (req, res) => {
+  try {
+    const email = sanitizeString(req.body.email, 254);
+    const password = req.body.password;
+
+    if (!email || !password) {
+      return res
+        .status(400)
+        .json({ message: "Email and password are required." });
+    }
+    if (password.length < 6 || password.length > 128) {
+      return res
+        .status(400)
+        .json({ message: "Password must be 6-128 characters." });
+    }
+    // Basic email validation
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ message: "Invalid email format." });
+    }
+
+    const { data, error } = await supabaseAdmin.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+    });
+
+    if (error) {
+      if (error.message.includes("already")) {
+        return res
+          .status(409)
+          .json({ message: "User with this email already exists." });
+      }
+      return res.status(400).json({ message: error.message });
+    }
+
+    res.status(201).json({ message: "User created successfully." });
+  } catch (error) {
+    console.error("Signup Error:", error);
+    res.status(500).json({ message: "Internal server error." });
+  }
 });
 
-app.post('/api/auth/login', authLimiter, async (req, res) => {
-    try {
-        const { email, password } = req.body;
-        if (!email || !password) {
-            return res.status(400).json({ message: 'Email and password are required.' });
-        }
-        const [users] = await dbPool.query('SELECT * FROM users WHERE email = ?', [email]);
-        if (users.length === 0) {
-            return res.status(401).json({ message: 'Invalid credentials.' });
-        }
-        const user = users[0];
-        const isMatch = await bcrypt.compare(password, user.password);
-        if (!isMatch) {
-            return res.status(401).json({ message: 'Invalid credentials.' });
-        }
-        // Use a shorter expiration for better security
-        const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
-        res.json({ token, message: 'Logged in successfully!' });
-    } catch (error) {
-        res.status(500).json({ message: 'Internal server error.' });
+app.post("/api/auth/login", authLimiter, async (req, res) => {
+  try {
+    const email = sanitizeString(req.body.email, 254);
+    const password = req.body.password;
+
+    if (!email || !password) {
+      return res
+        .status(400)
+        .json({ message: "Email and password are required." });
     }
+
+    const { data, error } = await supabaseAdmin.auth.signInWithPassword({
+      email,
+      password,
+    });
+
+    if (error) {
+      return res.status(401).json({ message: "Invalid credentials." });
+    }
+
+    res.json({
+      token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
+      user: { id: data.user.id, email: data.user.email },
+      message: "Logged in successfully!",
+    });
+  } catch (error) {
+    console.error("Login Error:", error);
+    res.status(500).json({ message: "Internal server error." });
+  }
 });
 
-// --- GOOGLE AUTH ROUTE ---
-app.post('/api/auth/google', async (req, res) => {
-    try {
-        const { credential } = req.body;
+app.post("/api/auth/google", authLimiter, async (req, res) => {
+  try {
+    const { access_token, id_token } = req.body;
 
+    const { data, error } = await supabaseAdmin.auth.signInWithIdToken({
+      provider: "google",
+      token: id_token || access_token,
+    });
 
-
-        if (!credential) {
-            return res.status(400).json({ message: 'Credential not provided.' });
-        }
-
-        const ticket = await client.verifyIdToken({
-            idToken: credential,
-            audience: process.env.GOOGLE_CLIENT_ID,
-        });
-        const payload = ticket.getPayload();
-        const { email } = payload;
-
-        let [users] = await dbPool.query('SELECT * FROM users WHERE email = ?', [email]);
-        let user = users[0];
-
-        if (!user) {
-            const randomPassword = Math.random().toString(36).slice(-8);
-            const hashedPassword = await bcrypt.hash(randomPassword, 10);
-            const [newUser] = await dbPool.query('INSERT INTO users (email, password) VALUES (?, ?)', [email, hashedPassword]);
-            user = { id: newUser.insertId, email };
-        }
-
-        const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '8h' });
-        res.json({ token, message: 'Logged in successfully!' });
-
-    } catch (error) {
-        console.error("Google Auth Error:", error);
-        res.status(500).json({ message: 'Google authentication failed.' });
+    if (error) {
+      console.error("Google Auth Error:", error);
+      return res.status(401).json({ message: "Google authentication failed." });
     }
+
+    res.json({
+      token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
+      user: { id: data.user.id, email: data.user.email },
+      message: "Logged in successfully!",
+    });
+  } catch (error) {
+    console.error("Google Auth Error:", error);
+    res.status(500).json({ message: "Google authentication failed." });
+  }
 });
 
-
-// --- Data Routes ---
-app.get('/api/data', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.userId;
-        const [folders] = await dbPool.query('SELECT * FROM folders WHERE user_id = ?', [userId]);
-        const [snippets] = await dbPool.query('SELECT * FROM snippets WHERE user_id = ? ORDER BY id DESC', [userId]);
-
-        const buildTree = (list) => {
-            const map = {};
-            const roots = [];
-            list.forEach((item, i) => {
-                map[item.id] = i;
-                list[i].subfolders = [];
-                list[i].snippets = snippets.filter(s => s.folder_id === item.id);
-            });
-
-            list.forEach(item => {
-                if (item.parent_id !== null) {
-                    if (list[map[item.parent_id]]) {
-                       list[map[item.parent_id]].subfolders.push(item);
-                    }
-                } else {
-                    roots.push(item);
-                }
-            });
-            return roots;
-        };
-
-        const folderTree = buildTree(folders);
-        const standaloneSnippets = snippets.filter(s => s.folder_id === null);
-
-        res.json({ folders: folderTree, standaloneSnippets });
-    } catch (error) {
-        console.error("Get Data Error:", error);
-        res.status(500).json({ message: 'Failed to fetch data.' });
+app.post("/api/auth/refresh", authLimiter, async (req, res) => {
+  try {
+    const { refresh_token } = req.body;
+    if (!refresh_token) {
+      return res.status(400).json({ message: "Refresh token required." });
     }
+
+    const { data, error } = await supabaseAdmin.auth.refreshSession({
+      refresh_token,
+    });
+
+    if (error) {
+      return res
+        .status(401)
+        .json({ message: "Session expired. Please login again." });
+    }
+
+    res.json({
+      token: data.session.access_token,
+      refresh_token: data.session.refresh_token,
+    });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to refresh session." });
+  }
 });
 
-app.post('/api/folders', authenticateToken, async (req, res) => {
-    try {
-        const { name, parentId } = req.body;
-        const userId = req.user.userId;
+// =============================================================
+// DATA ROUTES (optimized for large datasets)
+// =============================================================
 
-        const [existingFolders] = await dbPool.query(
-            'SELECT * FROM folders WHERE user_id = ? AND name = ? AND parent_id <=> ?',
-            [userId, name, parentId || null] // <=> is a NULL-safe equality operator
-        );
-         if (existingFolders.length > 0) {
-            return res.status(409).json({ message: 'A folder with this name already exists.' });
-        }
+// GET all folders and snippets for current user
+app.get("/api/data", authenticateToken, async (req, res) => {
+  try {
+    const supabase = createUserClient(req.token);
+    const userId = req.user.id;
 
-        const [result] = await dbPool.query('INSERT INTO folders (user_id, name, parent_id, is_starred) VALUES (?, ?, ?, FALSE)', [userId, name, parentId || null]);
-        res.status(201).json({ id: result.insertId, name, user_id: userId, parent_id: parentId || null, subfolders: [], snippets: [], is_starred: false });
-    } catch (error) {
-        console.error("Create Folder Error:", error);
-        res.status(500).json({ message: 'Failed to create folder.' });
+    // Parallel fetch for performance
+    const [foldersResult, snippetsResult] = await Promise.all([
+      supabase
+        .from("folders")
+        .select("id,user_id,name,parent_id,is_starred,created_at")
+        .eq("user_id", userId)
+        .order("created_at", { ascending: true }),
+      supabase
+        .from("snippets")
+        .select(
+          "id,user_id,folder_id,title,code,language,is_starred,created_at",
+        )
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false }),
+    ]);
+
+    if (foldersResult.error) throw foldersResult.error;
+    if (snippetsResult.error) throw snippetsResult.error;
+
+    const folders = foldersResult.data || [];
+    const snippets = snippetsResult.data || [];
+
+    // Build folder tree efficiently using a Map (O(n) instead of O(n²))
+    const folderMap = new Map();
+    const roots = [];
+
+    for (const folder of folders) {
+      folderMap.set(folder.id, {
+        ...folder,
+        subfolders: [],
+        snippets: [],
+      });
     }
+
+    // Assign snippets to folders
+    const standaloneSnippets = [];
+    for (const snippet of snippets) {
+      if (snippet.folder_id && folderMap.has(snippet.folder_id)) {
+        folderMap.get(snippet.folder_id).snippets.push(snippet);
+      } else {
+        standaloneSnippets.push(snippet);
+      }
+    }
+
+    // Build tree structure
+    for (const folder of folderMap.values()) {
+      if (folder.parent_id && folderMap.has(folder.parent_id)) {
+        folderMap.get(folder.parent_id).subfolders.push(folder);
+      } else {
+        roots.push(folder);
+      }
+    }
+
+    res.json({ folders: roots, standaloneSnippets });
+  } catch (error) {
+    console.error("Get Data Error:", error);
+    res.status(500).json({ message: "Failed to fetch data." });
+  }
 });
 
-// --- NEW ROUTE FOR RENAMING FOLDERS ---
-app.put('/api/folders/:id', authenticateToken, async (req, res) => {
-    try {
-        const { name } = req.body;
-        const { id } = req.params;
-        const userId = req.user.userId;
+// CREATE folder
+app.post("/api/folders", authenticateToken, async (req, res) => {
+  try {
+    const name = sanitizeString(req.body.name, 200);
+    const parentId = req.body.parentId || null;
+    const supabase = createUserClient(req.token);
+    const userId = req.user.id;
 
-        if (!name) {
-            return res.status(400).json({ message: 'Folder name is required.' });
-        }
-
-        const [result] = await dbPool.query(
-            'UPDATE folders SET name = ? WHERE id = ? AND user_id = ?',
-            [name, id, userId]
-        );
-
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ message: 'Folder not found or you are not authorized to edit it.' });
-        }
-
-        res.json({ message: 'Folder renamed successfully.' });
-    } catch (error) {
-        console.error("Rename Folder Error:", error);
-        res.status(500).json({ message: 'Failed to rename folder.' });
+    if (!name) {
+      return res.status(400).json({ message: "Folder name is required." });
     }
+
+    // Validate parentId if provided
+    if (parentId && !validateUUID(parentId)) {
+      return res.status(400).json({ message: "Invalid parent folder ID." });
+    }
+
+    const { data, error } = await supabase
+      .from("folders")
+      .insert({
+        user_id: userId,
+        name,
+        parent_id: parentId,
+        is_starred: false,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === "23505") {
+        return res
+          .status(409)
+          .json({ message: "A folder with this name already exists." });
+      }
+      throw error;
+    }
+
+    res.status(201).json({ ...data, subfolders: [], snippets: [] });
+  } catch (error) {
+    console.error("Create Folder Error:", error);
+    res.status(500).json({ message: "Failed to create folder." });
+  }
 });
 
-app.post('/api/snippets', authenticateToken, async (req, res) => {
-    try {
-        const { title, code, folderId } = req.body;
-        const userId = req.user.userId;
+// RENAME folder
+app.put("/api/folders/:id", authenticateToken, async (req, res) => {
+  try {
+    const name = sanitizeString(req.body.name, 200);
+    const { id } = req.params;
+    const supabase = createUserClient(req.token);
 
-        const [existingSnippets] = await dbPool.query(
-            'SELECT * FROM snippets WHERE user_id = ? AND title = ? AND folder_id <=> ?',
-            [userId, title, folderId || null]
-        );
-
-        if (existingSnippets.length > 0) {
-            return res.status(409).json({ message: 'A snippet with this title already exists.' });
-        }
-
-        const [result] = await dbPool.query('INSERT INTO snippets (user_id, title, code, folder_id, is_starred) VALUES (?, ?, ?, ?, FALSE)', [userId, title, code, folderId || null]);
-        res.status(201).json({ id: result.insertId, title, code, user_id: userId, folder_id: folderId || null, is_starred: false });
-    } catch (error) {
-        console.error("Create Snippet Error:", error);
-        res.status(500).json({ message: 'Failed to create snippet.' });
+    if (!name) {
+      return res.status(400).json({ message: "Folder name is required." });
     }
+    if (!validateUUID(id)) {
+      return res.status(400).json({ message: "Invalid folder ID." });
+    }
+
+    const { data, error } = await supabase
+      .from("folders")
+      .update({ name })
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ message: "Folder not found." });
+
+    res.json({ message: "Folder renamed successfully.", folder: data });
+  } catch (error) {
+    console.error("Rename Folder Error:", error);
+    res.status(500).json({ message: "Failed to rename folder." });
+  }
 });
 
-app.put('/api/snippets/:id', authenticateToken, async (req, res) => {
-    try {
-        const { title, code } = req.body;
-        const { id } = req.params;
-        const userId = req.user.userId;
-        await dbPool.query('UPDATE snippets SET title = ?, code = ? WHERE id = ? AND user_id = ?', [title, code, id, userId]);
-        res.json({ message: 'Snippet updated successfully' });
-    } catch (error) {
-        console.error("Update Snippet Error:", error);
-        res.status(500).json({ message: 'Failed to update snippet.' });
+// DELETE folder (cascade handled by DB)
+app.delete("/api/folders/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateUUID(id)) {
+      return res.status(400).json({ message: "Invalid folder ID." });
     }
+    const supabase = createUserClient(req.token);
+
+    const { error } = await supabase
+      .from("folders")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", req.user.id);
+
+    if (error) throw error;
+    res.sendStatus(204);
+  } catch (error) {
+    console.error("Delete Folder Error:", error);
+    res.status(500).json({ message: "Failed to delete folder." });
+  }
 });
 
-app.delete('/api/folders/:id', authenticateToken, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const userId = req.user.userId;
-        await dbPool.query('DELETE FROM folders WHERE id = ? AND user_id = ?', [id, userId]);
-        res.sendStatus(204);
-    } catch (error) {
-        console.error("Delete Folder Error:", error);
-        res.status(500).json({ message: 'Failed to delete folder.' });
+// TOGGLE folder star
+app.put("/api/folders/:id/star", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateUUID(id)) {
+      return res.status(400).json({ message: "Invalid folder ID." });
     }
+    const supabase = createUserClient(req.token);
+
+    const { data: folder, error: fetchError } = await supabase
+      .from("folders")
+      .select("is_starred")
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .single();
+
+    if (fetchError) throw fetchError;
+    if (!folder) return res.status(404).json({ message: "Folder not found." });
+
+    const { error } = await supabase
+      .from("folders")
+      .update({ is_starred: !folder.is_starred })
+      .eq("id", id)
+      .eq("user_id", req.user.id);
+
+    if (error) throw error;
+    res.json({
+      message: "Folder star status updated.",
+      is_starred: !folder.is_starred,
+    });
+  } catch (error) {
+    console.error("Toggle Folder Star Error:", error);
+    res.status(500).json({ message: "Failed to update folder star status." });
+  }
 });
 
-app.delete('/api/snippets/:id', authenticateToken, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const userId = req.user.userId;
-        await dbPool.query('DELETE FROM snippets WHERE id = ? AND user_id = ?', [id, userId]);
-        res.sendStatus(204);
-    } catch (error) {
-        console.error("Delete Snippet Error:", error);
-        res.status(500).json({ message: 'Failed to delete snippet.' });
+// CREATE snippet (supports large code payloads)
+app.post("/api/snippets", authenticateToken, async (req, res) => {
+  try {
+    const title = sanitizeString(req.body.title, 300);
+    const code = typeof req.body.code === "string" ? req.body.code : ""; // Don't truncate code!
+    const folderId = req.body.folderId || null;
+    const language = sanitizeString(req.body.language || "javascript", 50);
+    const supabase = createUserClient(req.token);
+    const userId = req.user.id;
+
+    if (!title) {
+      return res.status(400).json({ message: "Snippet title is required." });
     }
+    if (folderId && !validateUUID(folderId)) {
+      return res.status(400).json({ message: "Invalid folder ID." });
+    }
+
+    const { data, error } = await supabase
+      .from("snippets")
+      .insert({
+        user_id: userId,
+        title,
+        code,
+        folder_id: folderId,
+        language,
+        is_starred: false,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === "23505") {
+        return res
+          .status(409)
+          .json({ message: "A snippet with this title already exists." });
+      }
+      throw error;
+    }
+
+    res.status(201).json(data);
+  } catch (error) {
+    console.error("Create Snippet Error:", error);
+    res.status(500).json({ message: "Failed to create snippet." });
+  }
 });
 
-// --- STAR TOGGLE ROUTES ---
-app.put('/api/folders/:id/star', authenticateToken, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const userId = req.user.userId;
-        // Toggle the is_starred status
-        await dbPool.query('UPDATE folders SET is_starred = NOT is_starred WHERE id = ? AND user_id = ?', [id, userId]);
-        res.json({ message: 'Folder star status updated.' });
-    } catch (error) {
-        console.error("Toggle Folder Star Error:", error);
-        res.status(500).json({ message: 'Failed to update folder star status.' });
+// UPDATE snippet
+app.put("/api/snippets/:id", authenticateToken, async (req, res) => {
+  try {
+    const { title, code } = req.body;
+    const { id } = req.params;
+    if (!validateUUID(id)) {
+      return res.status(400).json({ message: "Invalid snippet ID." });
     }
+    const supabase = createUserClient(req.token);
+
+    const { data, error } = await supabase
+      .from("snippets")
+      .update({ title, code })
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json({ message: "Snippet updated successfully", snippet: data });
+  } catch (error) {
+    console.error("Update Snippet Error:", error);
+    res.status(500).json({ message: "Failed to update snippet." });
+  }
 });
 
-app.put('/api/snippets/:id/star', authenticateToken, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const userId = req.user.userId;
-        // Toggle the is_starred status
-        await dbPool.query('UPDATE snippets SET is_starred = NOT is_starred WHERE id = ? AND user_id = ?', [id, userId]);
-        res.json({ message: 'Snippet star status updated.' });
-    } catch (error) {
-        console.error("Toggle Snippet Star Error:", error);
-        res.status(500).json({ message: 'Failed to update snippet star status.' });
+// DELETE snippet
+app.delete("/api/snippets/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateUUID(id)) {
+      return res.status(400).json({ message: "Invalid snippet ID." });
     }
+    const supabase = createUserClient(req.token);
+
+    const { error } = await supabase
+      .from("snippets")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", req.user.id);
+
+    if (error) throw error;
+    res.sendStatus(204);
+  } catch (error) {
+    console.error("Delete Snippet Error:", error);
+    res.status(500).json({ message: "Failed to delete snippet." });
+  }
 });
 
-// --- Server Start ---
+// TOGGLE snippet star
+app.put("/api/snippets/:id/star", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!validateUUID(id)) {
+      return res.status(400).json({ message: "Invalid snippet ID." });
+    }
+    const supabase = createUserClient(req.token);
+
+    const { data: snippet, error: fetchError } = await supabase
+      .from("snippets")
+      .select("is_starred")
+      .eq("id", id)
+      .eq("user_id", req.user.id)
+      .single();
+
+    if (fetchError) throw fetchError;
+    if (!snippet)
+      return res.status(404).json({ message: "Snippet not found." });
+
+    const { error } = await supabase
+      .from("snippets")
+      .update({ is_starred: !snippet.is_starred })
+      .eq("id", id)
+      .eq("user_id", req.user.id);
+
+    if (error) throw error;
+    res.json({
+      message: "Snippet star status updated.",
+      is_starred: !snippet.is_starred,
+    });
+  } catch (error) {
+    console.error("Toggle Snippet Star Error:", error);
+    res.status(500).json({ message: "Failed to update snippet star status." });
+  }
+});
+
+// =============================================================
+// AI PROXY ROUTE (Gemini API key stays server-side)
+// =============================================================
+
+app.post("/api/ai/generate", authenticateToken, aiLimiter, async (req, res) => {
+  try {
+    const prompt = sanitizeString(req.body.prompt, 5000);
+    const context = req.body.context
+      ? sanitizeString(req.body.context, 10000)
+      : "";
+
+    if (!prompt) {
+      return res.status(400).json({ message: "Prompt is required." });
+    }
+
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    if (!geminiApiKey) {
+      return res.status(500).json({ message: "AI service is not configured." });
+    }
+
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`;
+
+    const payload = {
+      contents: [
+        {
+          parts: [{ text: context ? `${context}\n\n${prompt}` : prompt }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 8192,
+      },
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000); // 25s timeout for AI
+
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error?.message || "Gemini API error");
+    }
+
+    const result = await response.json();
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!text) {
+      throw new Error("AI did not return a valid response.");
+    }
+
+    res.json({ response: text });
+  } catch (error) {
+    console.error("AI Generate Error:", error);
+    if (error.name === "AbortError") {
+      return res.status(504).json({ message: "AI request timed out." });
+    }
+    res.status(500).json({ message: error.message || "AI generation failed." });
+  }
+});
+
+// AI Chat endpoint with conversation history
+app.post("/api/ai/chat", authenticateToken, aiLimiter, async (req, res) => {
+  try {
+    const prompt = sanitizeString(req.body.prompt, 5000);
+    const code =
+      typeof req.body.code === "string" ? req.body.code.slice(0, 50000) : ""; // Up to 50K chars of code
+    const history = Array.isArray(req.body.history)
+      ? req.body.history.slice(-20)
+      : []; // Last 20 messages only
+
+    if (!prompt) {
+      return res.status(400).json({ message: "Prompt is required." });
+    }
+
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    if (!geminiApiKey) {
+      return res.status(500).json({ message: "AI service is not configured." });
+    }
+
+    const historyText = history
+      .map(
+        (msg) =>
+          `${msg.sender === "user" ? "User" : "AI"}: ${sanitizeString(msg.text, 2000)}`,
+      )
+      .join("\n");
+
+    const fullPrompt = `
+You are a helpful coding assistant named Sonic.
+Your goal is to help the user with their code snippet.
+
+System Instructions:
+1. You can analyze, fix bugs, optimize, refactor, add comments, explain, and modify code.
+2. When providing code changes, wrap them in proper markdown code blocks with the language specified.
+3. Be concise but thorough in your explanations.
+4. If the user asks about improving performance or optimizing the code:
+   - Analyze the code for performance bottlenecks.
+   - Briefly explain the potential improvements.
+   - Ask the user: "Would you like me to apply these optimizations to your code?"
+5. If the user confirms after your suggestion, provide the FULL optimized code block.
+6. For bug fixes, clearly explain what was wrong and provide the corrected code.
+7. Always ensure code is complete and ready to use.
+
+Code Snippet:
+---
+${code || "No code provided"}
+---
+
+Chat History:
+${historyText}
+
+User's Question: "${prompt}"
+`;
+
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`;
+
+    const payload = {
+      contents: [{ parts: [{ text: fullPrompt }] }],
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 8192,
+      },
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error?.message || "Gemini API error");
+    }
+
+    const result = await response.json();
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!text) {
+      throw new Error("AI did not return a valid response.");
+    }
+
+    res.json({ response: text });
+  } catch (error) {
+    console.error("AI Chat Error:", error);
+    if (error.name === "AbortError") {
+      return res.status(504).json({ message: "AI request timed out." });
+    }
+    res.status(500).json({ message: error.message || "AI chat failed." });
+  }
+});
+
+// AI snippet action (check, correct, add_comments)
+app.post("/api/ai/action", authenticateToken, aiLimiter, async (req, res) => {
+  try {
+    const action = sanitizeString(req.body.action, 50);
+    const code =
+      typeof req.body.code === "string" ? req.body.code.slice(0, 50000) : "";
+
+    if (!code || !action) {
+      return res.status(400).json({ message: "Code and action are required." });
+    }
+
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    if (!geminiApiKey) {
+      return res.status(500).json({ message: "AI service is not configured." });
+    }
+
+    let prompt = "";
+    switch (action) {
+      case "check":
+        prompt = `Analyze the following code snippet and identify the single line that contains the most significant error or bug. Return ONLY that single line of code, with no explanation, markdown, or any other text.\n\n${code}`;
+        break;
+      case "correct":
+        prompt = `Correct the following code snippet. Fix any bugs or errors. Only return the raw, corrected code with no explanation or markdown formatting.\n\n${code}`;
+        break;
+      case "add_comments":
+        prompt = `Add clear and descriptive comments to the following code snippet where necessary. Do not change the code logic. Only return the raw, updated code with no explanation or markdown formatting.\n\n${code}`;
+        break;
+      case "explain":
+        prompt = `Explain the following code snippet in a clear, concise way. Describe what each significant part does.\n\n${code}`;
+        break;
+      default:
+        return res.status(400).json({ message: "Invalid action." });
+    }
+
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`;
+
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.3,
+        maxOutputTokens: 8192,
+      },
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error?.message || "Gemini API error");
+    }
+
+    const result = await response.json();
+    const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!text) {
+      throw new Error("AI did not return a valid response.");
+    }
+
+    // Clean the response for code actions
+    const cleanedText =
+      action === "check" || action === "explain"
+        ? text.trim()
+        : text
+            .replace(/```[\w\s]*\n/g, "")
+            .replace(/```/g, "")
+            .trim();
+
+    res.json({ response: cleanedText });
+  } catch (error) {
+    console.error("AI Action Error:", error);
+    if (error.name === "AbortError") {
+      return res.status(504).json({ message: "AI request timed out." });
+    }
+    res.status(500).json({ message: error.message || "AI action failed." });
+  }
+});
+
+// =============================================================
+// HEALTH CHECK
+// =============================================================
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// --- Global error handler ---
+app.use((err, req, res, next) => {
+  console.error("Unhandled Error:", err);
+  res.status(500).json({ message: "Internal server error." });
+});
+
+// --- Server Start with graceful shutdown ---
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, async () => {
-  await ensureStarredColumns();
+const server = app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
+  console.log(
+    `Supabase URL: ${process.env.SUPABASE_URL ? "✓ configured" : "✗ missing"}`,
+  );
+  console.log(
+    `Gemini API Key: ${process.env.GEMINI_API_KEY ? "✓ configured" : "✗ missing"}`,
+  );
 });
+
+// Graceful shutdown
+const shutdown = () => {
+  console.log("\nShutting down gracefully...");
+  server.close(() => {
+    console.log("Server closed.");
+    process.exit(0);
+  });
+  setTimeout(() => {
+    console.error("Forced shutdown.");
+    process.exit(1);
+  }, 10000);
+};
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
+
+// Export for Vercel serverless function
+module.exports = app;
