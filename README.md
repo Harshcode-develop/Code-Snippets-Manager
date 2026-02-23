@@ -9,18 +9,13 @@ A personal code snippets manager enhanced with AI capabilities.
 - Tailwind CSS
 - Node.js
 - Express.js
-- Supabase
+- MySQL
 - Google Gemini API
 - Google OAuth 2.0
-```markdown
-- Framer Motion
-- Lucide React
-- React Hot Toast
-
 
 ## AI Features & Uniqueness
 
-SonicxCode stands out with its deeply integrated AI assistant, **Sonic**, powered by Google Gemini.
+sonicxcode stands out with its deeply integrated AI assistant, **Sonic**, powered by Google Gemini.
 
 - **Context-Aware Chat**: Sonic understands the specific code snippet you are viewing, allowing for precise debugging and optimization advice.
 - **Voice Interaction**:
@@ -29,3 +24,7 @@ SonicxCode stands out with its deeply integrated AI assistant, **Sonic**, powere
 - **Interactive Coding**:
   - **One-Click Apply**: Instantly apply AI-generated code fixes to your snippets with a single click.
   - **Performance Checks**: Sonic proactively suggests performance improvements and asks for permission before modifying your code.
+- **Snippet Management**: Create, read, update, and delete code snippets easily.
+- **Folder Organization**: Keep your snippets sorted into custom folders.
+- **Syntax Highlighting**: Auto-detects and highlights code for better readability.
+- **Secure Authentication**: Sign up via email/password or use Google Login.
