@@ -93,7 +93,7 @@ export const SignInModal: React.FC<Props> = ({
 
   return (
     <div
-      className="fixed inset-0 z-[70] flex items-center justify-center p-4 animate-fade-in"
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 animate-fade-in"
       onClick={onClose}
     >
       {/* Blurred background overlay */}
@@ -104,7 +104,7 @@ export const SignInModal: React.FC<Props> = ({
         className="relative z-10 w-full max-w-md animate-scale-in"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="bg-bg-card/15 backdrop-blur-2xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden glass-strong">
+        <div className="rounded-2xl shadow-2xl overflow-hidden glass-strong">
           {/* Close Button */}
           <button
             onClick={onClose}

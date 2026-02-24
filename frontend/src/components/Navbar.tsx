@@ -128,7 +128,7 @@ export const Navbar: React.FC<Props> = React.memo(
         {/* Logout Confirmation */}
         {showLogoutConfirm && (
           <div
-            className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-bg-overlay animate-fade-in"
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-bg-overlay animate-fade-in"
             onClick={cancelLogout}
           >
             <div

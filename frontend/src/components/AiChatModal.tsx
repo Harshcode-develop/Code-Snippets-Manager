@@ -152,7 +152,7 @@ export const AiChatModal: React.FC<Props> = memo(
         onClick={onClose}
       >
         <div
-          className="bg-bg-card/30 backdrop-blur-2xl border border-white/10 rounded-2xl w-full max-w-5xl h-[85vh] flex flex-col shadow-2xl animate-scale-in overflow-hidden relative"
+          className="glass-strong rounded-2xl w-full max-w-5xl h-[85vh] flex flex-col shadow-2xl animate-scale-in overflow-hidden relative"
           onClick={(e) => e.stopPropagation()}
         >
           {/* Header */}

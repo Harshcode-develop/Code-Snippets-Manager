@@ -141,12 +141,25 @@ export const ParticlesBackground: React.FC = () => {
             height / 2,
             outerRadius,
           );
-          gradient.addColorStop(0, "rgba(255, 255, 255, 1)");
-          gradient.addColorStop(0.3, "rgba(255, 255, 255, 0.3)");
-          gradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+
+          // Get the current theme to adapt colors
+          const isLight =
+            document.documentElement.getAttribute("data-theme") === "light";
+
+          if (isLight) {
+            // Very subtle color for light mode so it doesn't stand out too much
+            gradient.addColorStop(0, "rgba(99, 102, 241, 0.12)"); // primary color
+            gradient.addColorStop(0.3, "rgba(236, 72, 153, 0.05)"); // secondary color
+            gradient.addColorStop(1, "rgba(255, 255, 255, 0)");
+          } else {
+            // Ambient dark mode nebula
+            gradient.addColorStop(0, "rgba(99, 102, 241, 0.2)"); // primary color
+            gradient.addColorStop(0.3, "rgba(236, 72, 153, 0.1)"); // secondary color
+            gradient.addColorStop(1, "rgba(0, 0, 0, 0)");
+          }
 
           ctx.fillStyle = gradient;
-          ctx.globalAlpha = 0.9 + Math.sin(time * 3) * 0.1;
+          ctx.globalAlpha = 1;
           ctx.fill();
         }
 

@@ -291,17 +291,17 @@ body {
   }
 
   .glass-strong {
-    background: rgba(255, 255, 255, 0.08);
+    background: color-mix(in srgb, var(--color-bg-card) 92%, transparent);
     backdrop-filter: blur(40px);
     -webkit-backdrop-filter: blur(40px);
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.08);
   }
 
   [data-theme="light"] .glass-strong {
-    background: rgba(255, 255, 255, 0.05);
-    backdrop-filter: blur(25px);
-    -webkit-backdrop-filter: blur(25px);
-    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: color-mix(in srgb, var(--color-bg-card) 92%, transparent);
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
+    border: 1px solid rgba(0, 0, 0, 0.06);
   }
 
   .gradient-text {

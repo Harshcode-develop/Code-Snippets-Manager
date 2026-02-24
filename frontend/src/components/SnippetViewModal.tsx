@@ -94,7 +94,7 @@ export const SnippetViewModal: React.FC<Props> = ({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-5xl h-[85vh] flex flex-col bg-bg-card/30 backdrop-blur-2xl border border-white/10 rounded-2xl shadow-2xl overflow-hidden animate-scale-in"
+        className="w-full max-w-5xl h-[85vh] flex flex-col glass-strong rounded-2xl shadow-2xl overflow-hidden animate-scale-in"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
