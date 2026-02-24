@@ -130,12 +130,14 @@ export default function App() {
       const {
         data: { subscription: sub },
       } = supabase.auth.onAuthStateChange(async (_event, session) => {
+        if (_event === "INITIAL_SESSION") return;
+
         if (session) {
           setToken(session.access_token);
           Cookies.set("auth_token", session.access_token, { expires: 30 });
           setIsGuest(false);
           await fetchUserData(session.access_token);
-        } else {
+        } else if (_event === "SIGNED_OUT") {
           setToken(null);
           Cookies.remove("auth_token");
           setIsGuest(true);
